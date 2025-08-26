@@ -1,6 +1,12 @@
 # Pytorch Conditional-Flow-Matching(CFM) Tutorial
 A simple tutorial of [Conditional Flow Matching Models](https://arxiv.org/abs/2210.02747) (CFMs, Y. Lipman et. al., 2022) using MNIST dataset.
 
+
+# Implementations
+* [Conditional Flow Matching](https://arxiv.org/abs/2210.02747)
+* [MeanFlow](https://arxiv.org/abs/2505.13447)
+
+
 # Prerequisites
 (1) Download Pytorch and etcs.
 * [Anaconda](https://www.anaconda.com/)
@@ -33,4 +39,5 @@ sh install.sh
 
 [3] [Flow Matching for Generative Modeling](https://arxiv.org/abs/2210.02747), Y. Lipman et. al., 2022
 
+[4] [Mean Flows for One-step Generative Modeling](https://arxiv.org/abs/2505.13447), Z. Geng et. al., 2025
 
