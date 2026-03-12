@@ -181,16 +181,9 @@ hpc_logs/
 .cfg/
 .conf/
 
-.
-hpc_scripts/
+
+runs/
 *.lsf
 *.sh
-*.py
-*.ipynb
-*.md
-*.txt
-*.csv
 *.json
-*.xml
 *.yaml
-*.yml
