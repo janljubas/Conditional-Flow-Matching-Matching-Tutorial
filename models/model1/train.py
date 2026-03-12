@@ -8,8 +8,12 @@ import time
 
 
 def build_parser():
-    """Build CLI parser for run paths, config, and optional overrides."""
-    parser = argparse.ArgumentParser(description="Train a simple Iris classifier.")
+    """
+    Builds CLI parser for run paths, config, and optional overrides.
+    Returns:
+        argparse.ArgumentParser: The parser object.
+    """
+    parser = argparse.ArgumentParser(description="Train a simple Iris dataset classifier.")
     parser.add_argument("--config", required=True, help="Path to YAML config file.")
     parser.add_argument("--run-dir", required=True, help="Directory to write run outputs.")
 
@@ -24,7 +28,9 @@ def build_parser():
 
 
 def load_yaml_config(config_path: Path):
-    """Load YAML config using PyYAML."""
+    """
+    Loads the YAML config form the given config file path using PyYAML.
+    """
     try:
         import yaml
     except ModuleNotFoundError as exc:
@@ -39,14 +45,23 @@ def load_yaml_config(config_path: Path):
 
 
 def pick_value(cli_value, config, key, default):
-    """Return CLI value if set, else config value, else default."""
+    """
+    Helper function to pick a value from the CLI, config, or default.
+
+    Returns the CLI value if set, else the config value, else the default value.
+    """
     if cli_value is not None:
         return cli_value
     return config.get(key, default)
 
 
 def resolve_run_settings(args, config):
-    """Resolve final run settings from CLI overrides + config + defaults."""
+    """
+    Resolves the final run settings from CLI overrides + config + defaults.
+    It makes sure that the model training method doesn't receive invalid values; it throws an error beforehand (easier to debug).
+
+    Returns a dictionary of the final run settings (called "settings" in the code, instead of "config").
+    """
     settings = {
         "dataset": str(pick_value(args.dataset, config, "dataset", "iris")).lower(),
         "model": str(pick_value(args.model, config, "model", "sgd_logistic")).lower(),
@@ -67,7 +82,10 @@ def resolve_run_settings(args, config):
 
 
 def train_iris(settings):
-    """Train on Iris and collect epoch-wise history plus final predictions."""
+    """
+    Trains on Iris and collects epoch-wise history plus final predictions.
+    Returns a dictionary of the training results.
+    """
     try:
         from sklearn.datasets import load_iris
         from sklearn.linear_model import SGDClassifier
@@ -142,7 +160,9 @@ def train_iris(settings):
 
 
 def save_results(run_dir: Path, train_out):
-    """Write metrics JSON and a small train.log summary file."""
+    """
+    Writes the metrics JSON and a small train.log summary file.
+    """
     metrics_path = run_dir / "metrics.json"
     metrics_path.write_text(json.dumps(train_out["metrics"], indent=2))
 
@@ -155,7 +175,9 @@ def save_results(run_dir: Path, train_out):
 
 
 def save_visualizations(run_dir: Path, train_out):
-    """Save training curves, confusion matrix, and coefficient plots."""
+    """
+    Saves the training curves, confusion matrix, and coefficient plots.
+    """
     try:
         import matplotlib.pyplot as plt
         from sklearn.metrics import ConfusionMatrixDisplay
@@ -219,14 +241,24 @@ def save_visualizations(run_dir: Path, train_out):
 
 
 def main():
-    """Parse args, train model, and save artifacts in run directory."""
+    """
+    Parse args, train the classification model, and save artifacts in run directory.
+    """
+
+    # Parse the arguments from the command line (might not be all of the needed arguments).
     args = build_parser().parse_args()
+
+    # Create the run directory (nothing happens if it already exists)
     run_dir = Path(args.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load the configuration from the YAML config file path.
     config = load_yaml_config(Path(args.config))
+
+    # Resolve the final run settings from CLI overrides + config + defaults.
     settings = resolve_run_settings(args, config)
 
+    # Train the classification model.
     start = time.time()
     train_out = train_iris(settings)
     train_out["metrics"]["elapsed_sec"] = round(time.time() - start, 4)
