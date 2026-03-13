@@ -1,3 +1,6 @@
+numpy
+matplotlib
+tqdm
+PyYAML
+scikit-learn
 jupyter
-tqdm==4.67.1
-matplotlib==3.10.0
