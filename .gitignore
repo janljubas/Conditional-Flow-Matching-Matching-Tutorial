@@ -187,3 +187,9 @@ runs/
 *.sh
 *.json
 *.yaml
+
+
+
+# datasets
+datasets/
+quantum_data/

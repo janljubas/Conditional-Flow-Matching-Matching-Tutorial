@@ -106,10 +106,10 @@ def train(settings, run_dir: Path):
             t = torch.rand(x_1.shape[0], 1, 1, 1, device=device)
 
             x_t = model.interpolate(x_0, x_1, t)
-            velocity_target = model.get_velocity(x_0, x_1)
-            velocity_pred = model(x_t, t)
+            velocity_target = model.get_velocity(x_0, x_1)  # u_t(x|z) = x_1 - x_0; the conditional velocity interpolation based on actual x_1 ~ p_1 samples
+            velocity_pred = model(x_t, t)                   # v_theta(x_t, t); the velocity field estimated by the model
 
-            loss = ((velocity_pred - velocity_target) ** 2).mean()
+            loss = ((velocity_pred - velocity_target) ** 2).mean()  # L_CFM = E[||v_theta(x_t, t) - u_t(x|z)||^2]
             total_loss += loss.item()
             loss.backward()
             optimizer.step()
