@@ -132,9 +132,10 @@ class CFMModel(nn.Module):
     def interpolate(self, x_0, x_1, t):
         '''
         This is the definition of the probability path mean:  μ_t(z) = t*x_1 + (1-t)*x_0:
-        the output is the linear interpolation between x_0 ~ p_0 and target data sample x_1 ~ p_1 at time t.
+        the output is the linear interpolation between x_0 ~ p_0 (e.g. x_0 ~ N(0,I))and target data sample x_1 ~ p_1 (e.g. x_1 ~ MNIST) at time t.
 
         We use this as target instead of simulating actual μ_t.
+        Note: once sigma is ~ 0, this means that the Gaussian of our probability path is almost a Dirac delta function.
         '''
         
         return (1 - (1 - self.sigma_min) * t) * x_0 + t * x_1
@@ -152,7 +153,7 @@ class CFMModel(nn.Module):
         Using the Euler method to (numerically, not symbolically) integrate the ODE, and hence generate a sample.
         '''
         x_0 = torch.randn(size=shape, device=device)  # sample a noise from "the noise distribution" p_0
-        t_vals = torch.linspace(0, 1, t_steps, device=device)  # sample t_steps number of t values from 0 to 1
+        t_vals = torch.linspace(0, 1, t_steps, device=device)  # sample t_steps number of t values from 0 to 1 ( t ~ U(0,1))
         delta = 1.0 / max(t_steps - 1, 1)   # literally the time differential dt; an ("infinitesimally") small increment of time
 
         x_1_hat = x_0
