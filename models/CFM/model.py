@@ -1,164 +1,340 @@
+"""
+Velocity network architectures for Conditional Flow Matching.
+
+CFM is a *training method* (Tong et al., 2024), not an architecture.
+The neural network v_theta(x_t, t) that parameterizes the velocity field
+can be any architecture that maps (x, t) -> velocity of the same shape as x.
+
+This module provides:
+  - VelocityNet        : abstract base class with shared CFM math helpers
+  - ConvStackVelocityNet : the original dilated-conv backbone (formerly CFMModel)
+  - UNetVelocityNet     : a U-Net backbone with skip connections and sinusoidal time embedding
+  - build_velocity_net  : factory function driven by config["backbone"]
+
+Paper references (Tong et al., 2024 -- "Improving and Generalizing Flow-Based
+Generative Models with Minibatch Optimal Transport"):
+  - Eq.13: CFM loss  L_CFM = E[ ||v_theta(t, x_t) - u_t(x|z)||^2 ]
+  - Eq.14: Probability path mean  mu_t = (1-t)*x_0 + t*x_1
+  - Eq.15: Conditional vector field  u_t(x|x_0,x_1) = x_1 - x_0
+"""
+
+import math
+
 import torch
 from torch import nn
 
 
-class ConvBlock(nn.Conv2d):
-    """
-    A simple Conv2d block with optional GroupNorm + SiLU.
+# ---------------------------------------------------------------------------
+# Base class
+# ---------------------------------------------------------------------------
 
-    Note that a plain convolution block is just a linear operation. Stacking only linear layers collapses into another linear function.
-    That's why we need to add non-linearity (e.g. SiLU) and normalization layers (e.g. GroupNorm) to make it a non-linear operation.
+class VelocityNet(nn.Module):
     """
+    Abstract base for velocity networks used in CFM training.
+    Subclasses must implement ``forward(x, t) -> velocity``.
+    Shared helpers: interpolate, get_velocity, sample.
+    """
+
+    def __init__(self, sigma_min: float = 0.0):
+        super().__init__()
+        self.sigma_min = sigma_min
+
+    # -- CFM math helpers (shared across all backbones) ---------------------
+
+    def get_velocity(self, x_0, x_1):
+        """Conditional vector field u_t(x|x_0,x_1) = x_1 - (1 - sigma_min)*x_0.
+        Tong et al. Eq.15 (reduces to x_1 - x_0 when sigma_min = 0)."""
+        return x_1 - (1 - self.sigma_min) * x_0
+
+    def interpolate(self, x_0, x_1, t):
+        """Probability path mean mu_t = (1 - (1-sigma_min)*t)*x_0 + t*x_1.
+        Tong et al. Eq.14 (reduces to (1-t)*x_0 + t*x_1 when sigma_min = 0).
+        With sigma ~ 0 the conditional distribution is a Dirac delta at mu_t."""
+        return (1 - (1 - self.sigma_min) * t) * x_0 + t * x_1
+
+    @torch.no_grad()
+    def sample(self, t_steps, shape, device, noise_sampler=None):
+        """Generate samples by Euler-integrating the learned ODE
+        dx/dt = v_theta(x, t) from t=0 to t=1.
+
+        If noise_sampler is provided, initial x_0 is drawn from it (e.g. quantum);
+        otherwise falls back to standard Gaussian."""
+        if noise_sampler is not None:
+            x = noise_sampler.sample(shape, device)
+        else:
+            x = torch.randn(size=shape, device=device)
+        delta = 1.0 / max(t_steps - 1, 1)
+        t_vals = torch.linspace(0, 1, t_steps, device=device)
+
+        for i in range(t_steps - 1):
+            t_cur = t_vals[i].view(1, 1, 1, 1).expand(shape[0], 1, 1, 1)
+            x = x + self(x, t_cur) * delta
+        return x
+
+    def forward(self, x, t):
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# ConvBlock (shared building block)
+# ---------------------------------------------------------------------------
+
+class ConvBlock(nn.Conv2d):
+    """Conv2d with optional GroupNorm + SiLU, supporting residual time-injection."""
 
     def __init__(
         self,
-        in_channels,            # number of input feature maps, e.g. 3 for RGB images
-        out_channels,           # number of output feature maps, e.g. 64 for 64 feature maps
-        kernel_size,            # size of the convolutional kernel, e.g. 3 for 3x3 kernel
-        activation_fn=None,     # boolean for an activation function
-        stride=1,               # stride of the convolutional kernel (controls downsampling or upsampling)
-        padding="same",         # padding of the convolutional kernel
+        in_channels,
+        out_channels,
+        kernel_size,
+        activation_fn=None,
+        stride=1,
+        padding="same",
         dilation=1,
-        groups=1,               # number of groups for the convolutional kernel
-        bias=True,              # boolean for the bias in the convolutional kernel
-        gn=False,               # boolean for the GroupNorm (type of normalization)
-        gn_groups=8,            # number of groups for the GroupNorm
+        groups=1,
+        bias=True,
+        gn=False,
+        gn_groups=8,
     ):
         if padding == "same":
             padding = kernel_size // 2 * dilation
 
         super().__init__(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            bias=bias,
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding, dilation=dilation,
+            groups=groups, bias=bias,
         )
         self.group_norm = nn.GroupNorm(gn_groups, out_channels) if gn else None
         self.activation_fn = nn.SiLU() if activation_fn else None
 
     def forward(self, x, time_embedding=None, residual=False):
-        '''
-        We use the convolution to extract features, we use normalization to stabilize the training, activation to make them expressive,
-        time embedding to tell the network what to do at each time step, residual connections to make learning easier and more stable,
-        and broadcast-add to inject global per-channel bias across spatial maps.
-        '''
         if residual:
-            '''
-            In the case of residual connections, we wish to make the network behave differently depending on time step t (e.g. noise level).
-            
-            We inject the time information before the convolution so that the convolution block acts as a function of both the input x and the time step t.
-            This embedding allows the filters to react differently to different noise levels.
-            It also allows the conditioning to happen inside a feature space extraction, not just after (because if it were only after, the convolution would be a linear function).
-            '''
             x = x + time_embedding
             y = x
             x = super().forward(x)
             y = y + x
         else:
             y = super().forward(x)
-        y = self.group_norm(y) if self.group_norm is not None else y            # first we clean up and normalize the output
-        y = self.activation_fn(y) if self.activation_fn is not None else y      # then we apply the non-linearity to enhance expressivity
+        if self.group_norm is not None:
+            y = self.group_norm(y)
+        if self.activation_fn is not None:
+            y = self.activation_fn(y)
         return y
 
 
-class CFMModel(nn.Module):
-    """
-    Conditional Flow Matching model implementation using a simple convolutional network (CNN) with time embedding.
-    """
+# ---------------------------------------------------------------------------
+# Backbone 1: ConvStackVelocityNet (the original architecture)
+# ---------------------------------------------------------------------------
+
+class ConvStackVelocityNet(VelocityNet):
+    """Dilated conv-stack velocity network (formerly CFMModel).
+    Grows receptive field exponentially via dilation without downsampling."""
 
     def __init__(self, image_resolution, hidden_dims=None, sigma_min=0.0):
-        super().__init__()
+        super().__init__(sigma_min=sigma_min)
         if hidden_dims is None:
-            hidden_dims = [256, 256]    
+            hidden_dims = [256, 256]
 
-        _, _, img_c = image_resolution      # expected format is (height, width, channels), e.g. (256, 256, 3) for 256x256 RGB images
-        
-        
-        self.in_project = ConvBlock(img_c, hidden_dims[0], kernel_size=7)   # first convolution layer, no dilation
-        # it maps the raw image to the feature space
-        # kernel size 7 is a common choice for image processing tasks; large receptive field early helps capture global information
-
-
-        self.time_project = nn.Sequential(  # time embedding projection
-            ConvBlock(1, hidden_dims[0], kernel_size=1, activation_fn=True),  # this is a 1x1 convolution layer (per-channel linear projection)
-            # it expands time embedding into the feature space, meaning that each channel in the feature space is a linear combination of the time embedding
-            # shape: (B, hidden_dims[0], 1, 1)
-            ConvBlock(hidden_dims[0], hidden_dims[1], kernel_size=1),         # again, a 1x1 convolution layer, but without activation function
-            # shape: (B, hidden_dims[1], 1, 1)
-            # time is now a feature map-like tensor
+        _, _, img_c = image_resolution
+        self.in_project = ConvBlock(img_c, hidden_dims[0], kernel_size=7)
+        self.time_project = nn.Sequential(
+            ConvBlock(1, hidden_dims[0], kernel_size=1, activation_fn=True),
+            ConvBlock(hidden_dims[0], hidden_dims[-1], kernel_size=1),
         )
-        # time t is typically of shape (B, 1), where B is the batch size, but for Conv2D we need to expand it to (B, 1, 1, 1);
-        # so that it can be broadcasted across the spatial dimensions.
 
-        # Here, instead of MLP, we use a sequence of conv layers to embed the time into the feature space.
-        # This is a common practice in diffusion models to keep the model architecture simple and efficient.
-
-
-        self.convs = nn.ModuleList(  # a list of layers that PyTorch will track and optimize
-            [ConvBlock(in_channels=hidden_dims[0], out_channels=hidden_dims[0], kernel_size=3)]
-            # the first of the hidden layers, keeps the same channel size, does basic feature processing
+        self.convs = nn.ModuleList(
+            [ConvBlock(hidden_dims[0], hidden_dims[0], kernel_size=3)]
         )
-        for idx in range(1, len(hidden_dims)):  # for each of the hidden layers
+        for idx in range(1, len(hidden_dims)):
             self.convs.append(
                 ConvBlock(
-                    hidden_dims[idx - 1],       # output channels from the previous layer
-                    hidden_dims[idx],           # input channels for the current layer, connecting to the previous layer's output
-                    kernel_size=3,
-                    dilation=3 ** ((idx - 1) // 2),     # dilation for the conv kernel, controls the receptive field size; grows like 1, 1, 3, 3, 9, 9, ...
-                    activation_fn=True,                 # activation function for the current layer
-                    gn=True,                            # boolean for the GroupNorm
-                    gn_groups=8,                        # number of groups for the GroupNorm
+                    hidden_dims[idx - 1], hidden_dims[idx], kernel_size=3,
+                    dilation=3 ** ((idx - 1) // 2),
+                    activation_fn=True, gn=True, gn_groups=8,
                 )
             )
-            # the current layer's output is connected to the next layer's input, and so on, creating a chain of layers
-            # a cool trick is that the receptive field grows exponentially, without downsampling (downsampling would mean losing information by averaging out the features)
 
-        self.out_project = ConvBlock(hidden_dims[-1], out_channels=img_c, kernel_size=3)  # final convolution layer
-        # it maps the feature space back to the image space
-        # shape: (B, img_c, H, W), which produces v_theta(x_t, t), which is the same shape as the input image x_t
-
-
-        self.sigma_min = sigma_min     # a hyperparameter that controls minimum noise level in FM models
-
-    def get_velocity(self, x_0, x_1):
-        # this is the definition of the conditional variable u_t(x|z) = x_1 - x_0, 
-        # with the assumption that q(z) = q(x_0)*q(x_1) (I-CFM)
-        return x_1 - (1 - self.sigma_min) * x_0
-
-    def interpolate(self, x_0, x_1, t):
-        '''
-        This is the definition of the probability path mean:  μ_t(z) = t*x_1 + (1-t)*x_0:
-        the output is the linear interpolation between x_0 ~ p_0 (e.g. x_0 ~ N(0,I))and target data sample x_1 ~ p_1 (e.g. x_1 ~ MNIST) at time t.
-
-        We use this as target instead of simulating actual μ_t.
-        Note: once sigma is ~ 0, this means that the Gaussian of our probability path is almost a Dirac delta function.
-        '''
-        
-        return (1 - (1 - self.sigma_min) * t) * x_0 + t * x_1
+        self.out_project = ConvBlock(hidden_dims[-1], img_c, kernel_size=3)
 
     def forward(self, x, t):
-        time_embedding = self.time_project(t)       # calling the time embedding projection
-        y = self.in_project(x)                      # the first convolution layer
+        te = self.time_project(t)
+        y = self.in_project(x)
         for block in self.convs:
-            y = block(y, time_embedding, residual=True)  # calling the hidden convolution layers
-        return self.out_project(y)                       # the final convolution layer
+            y = block(y, te, residual=True)
+        return self.out_project(y)
 
-    @torch.no_grad()
-    def sample(self, t_steps, shape, device):
-        '''
-        Using the Euler method to (numerically, not symbolically) integrate the ODE, and hence generate a sample.
-        '''
-        x_0 = torch.randn(size=shape, device=device)  # sample a noise from "the noise distribution" p_0
-        t_vals = torch.linspace(0, 1, t_steps, device=device)  # sample t_steps number of t values from 0 to 1 ( t ~ U(0,1))
-        delta = 1.0 / max(t_steps - 1, 1)   # literally the time differential dt; an ("infinitesimally") small increment of time
 
-        x_1_hat = x_0
-        for i in range(t_steps - 1):
-            t_cur = t_vals[i].view(1, 1, 1, 1).expand(shape[0], 1, 1, 1)  # current time t
-            velocity_pred = self(x_1_hat, t_cur)  # calling the model to estimate the velocity field; equivalent to `model(x_t, t)`
-            x_1_hat = x_1_hat + velocity_pred * delta
-        return x_1_hat
+# ---------------------------------------------------------------------------
+# Backbone 2: UNetVelocityNet
+# ---------------------------------------------------------------------------
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """Sinusoidal positional encoding for scalar t, followed by a 2-layer MLP.
+    Maps t of shape (B,1,1,1) -> (B, dim)."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+    def forward(self, t):
+        t_flat = t.view(-1)
+        half = self.dim // 2
+        freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device, dtype=t.dtype) / half)
+        args = t_flat[:, None] * freqs[None, :]
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        if self.dim % 2 == 1:
+            emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+        return self.mlp(emb)
+
+
+class ResBlock(nn.Module):
+    """Residual block with GroupNorm, SiLU, Conv, and additive time-conditioning."""
+
+    def __init__(self, channels, time_dim, dropout=0.0):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(min(8, channels), channels)
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(min(8, channels), channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.time_proj = nn.Linear(time_dim, channels)
+        self.act = nn.SiLU()
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x, t_emb):
+        h = self.act(self.norm1(x))
+        h = self.conv1(h)
+        h = h + self.time_proj(t_emb)[:, :, None, None]
+        h = self.act(self.norm2(h))
+        h = self.dropout(h)
+        h = self.conv2(h)
+        return x + h
+
+
+class DownBlock(nn.Module):
+    """Two ResBlocks followed by a stride-2 downsampling conv."""
+
+    def __init__(self, in_ch, out_ch, time_dim, dropout=0.0):
+        super().__init__()
+        self.res1 = ResBlock(in_ch, time_dim, dropout)
+        self.res2 = ResBlock(in_ch, time_dim, dropout)
+        self.down = nn.Conv2d(in_ch, out_ch, 3, stride=2, padding=1)
+
+    def forward(self, x, t_emb):
+        h = self.res1(x, t_emb)
+        h = self.res2(h, t_emb)
+        skip = h
+        h = self.down(h)
+        return h, skip
+
+
+class UpBlock(nn.Module):
+    """Upsample + concat skip + two ResBlocks."""
+
+    def __init__(self, in_ch, skip_ch, out_ch, time_dim, dropout=0.0):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, in_ch, 2, stride=2)
+        merged = in_ch + skip_ch
+        self.conv_merge = nn.Conv2d(merged, out_ch, 1)
+        self.res1 = ResBlock(out_ch, time_dim, dropout)
+        self.res2 = ResBlock(out_ch, time_dim, dropout)
+
+    def forward(self, x, skip, t_emb):
+        h = self.up(x)
+        if h.shape[-2:] != skip.shape[-2:]:
+            h = nn.functional.interpolate(h, size=skip.shape[-2:], mode="nearest")
+        h = torch.cat([h, skip], dim=1)
+        h = self.conv_merge(h)
+        h = self.res1(h, t_emb)
+        h = self.res2(h, t_emb)
+        return h
+
+
+class UNetVelocityNet(VelocityNet):
+    """
+    U-Net velocity network for CFM.
+
+    Architecture (for 28x28 MNIST or 32x32 CIFAR):
+        Encoder:  [C,H,W] -> [base,H,W] -> [base*2,H/2,W/2] -> [base*4,H/4,W/4]
+        Bottleneck: 2x ResBlock at lowest resolution
+        Decoder:  mirrors encoder with skip connections
+        Output:   [C,H,W] (predicted velocity, same shape as input)
+
+    Time conditioning: sinusoidal embedding -> MLP -> additive bias at every ResBlock.
+    """
+
+    def __init__(self, image_resolution, base_channels=64, sigma_min=0.0, dropout=0.0):
+        super().__init__(sigma_min=sigma_min)
+        _, _, img_c = image_resolution
+        time_dim = base_channels * 4
+        ch1, ch2, ch3 = base_channels, base_channels * 2, base_channels * 4
+
+        self.time_embed = SinusoidalTimeEmbedding(time_dim)
+        self.conv_in = nn.Conv2d(img_c, ch1, 3, padding=1)
+
+        self.down1 = DownBlock(ch1, ch2, time_dim, dropout)
+        self.down2 = DownBlock(ch2, ch3, time_dim, dropout)
+
+        self.bottleneck1 = ResBlock(ch3, time_dim, dropout)
+        self.bottleneck2 = ResBlock(ch3, time_dim, dropout)
+
+        self.up1 = UpBlock(ch3, ch2, ch2, time_dim, dropout)
+        self.up2 = UpBlock(ch2, ch1, ch1, time_dim, dropout)
+
+        self.norm_out = nn.GroupNorm(min(8, ch1), ch1)
+        self.conv_out = nn.Conv2d(ch1, img_c, 3, padding=1)
+        nn.init.zeros_(self.conv_out.weight)
+        nn.init.zeros_(self.conv_out.bias)
+
+    def forward(self, x, t):
+        t_emb = self.time_embed(t)
+        h = self.conv_in(x)
+
+        h, skip1 = self.down1(h, t_emb)
+        h, skip2 = self.down2(h, t_emb)
+
+        h = self.bottleneck1(h, t_emb)
+        h = self.bottleneck2(h, t_emb)
+
+        h = self.up1(h, skip2, t_emb)
+        h = self.up2(h, skip1, t_emb)
+
+        h = nn.functional.silu(self.norm_out(h))
+        return self.conv_out(h)
+
+
+# ---------------------------------------------------------------------------
+# Backward compat alias
+# ---------------------------------------------------------------------------
+CFMModel = ConvStackVelocityNet
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+def build_velocity_net(settings):
+    """Instantiate a velocity network based on settings['backbone']."""
+    backbone = settings.get("backbone", "convstack")
+    sigma_min = settings.get("sigma_min", 0.0)
+    img_res = settings["img_size"]
+
+    if backbone == "convstack":
+        return ConvStackVelocityNet(
+            image_resolution=img_res,
+            hidden_dims=settings.get("hidden_dims"),
+            sigma_min=sigma_min,
+        )
+    elif backbone == "unet":
+        return UNetVelocityNet(
+            image_resolution=img_res,
+            base_channels=settings.get("unet_base_channels", 64),
+            sigma_min=sigma_min,
+            dropout=settings.get("dropout", 0.0),
+        )
+    else:
+        raise ValueError(f"Unknown backbone '{backbone}'. Choose 'convstack' or 'unet'.")

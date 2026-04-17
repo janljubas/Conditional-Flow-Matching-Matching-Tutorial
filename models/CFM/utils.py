@@ -59,6 +59,9 @@ def _common_parser(description):
     parser.add_argument("--n-layers", type=int, default=None, help="Number of layers (default from config).")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (default from config).")
     parser.add_argument("--num-workers", type=int, default=None, help="Number of workers (default from config).")
+    parser.add_argument("--backbone", default=None, help="Velocity net backbone: 'convstack' or 'unet' (default from config).")
+    parser.add_argument("--noise-source", default=None, help="Noise source: 'gaussian' or 'quantum' (default from config).")
+    parser.add_argument("--quantum-data-path", default=None, help="Path to quantum data folder (default from config).")
     return parser
 
 
@@ -105,13 +108,21 @@ def resolve_train_settings(args, config):
     It makes sure that the model training method doesn't receive invalid values; it throws an error beforehand (easier to debug).
     Returns a dictionary of the final run settings (called "settings" in the code, instead of "config").
     '''
+    backbone = str(pick_value(args.backbone, config, "backbone", "convstack")).lower()
+    noise_source = str(pick_value(args.noise_source, config, "noise_source", "gaussian")).lower()
+    qpath = pick_value(args.quantum_data_path, config, "quantum_data_path", "")
     settings = {
         "dataset_path": str(Path(pick_value(args.dataset_path, config, "dataset_path", "~/datasets")).expanduser()),
         "dataset": str(pick_value(args.dataset, config, "dataset", "mnist")).lower(),
         "gpu_id": int(pick_value(args.gpu_id, config, "gpu_id", 0)),
         "cuda": bool(pick_value(args.cuda, config, "cuda", True)),
+        "backbone": backbone,
         "hidden_dim": int(pick_value(args.hidden_dim, config, "hidden_dim", 256)),
         "n_layers": int(pick_value(args.n_layers, config, "n_layers", 8)),
+        "unet_base_channels": int(config.get("unet_base_channels", 64)),
+        "dropout": float(config.get("dropout", 0.0)),
+        "noise_source": noise_source,
+        "quantum_data_path": str(Path(qpath).expanduser()) if qpath else "",
         "lr": float(pick_value(args.lr, config, "lr", 5e-5)),
         "sigma_min": float(pick_value(args.sigma_min, config, "sigma_min", 0.0)),
         "n_epochs": int(pick_value(args.n_epochs, config, "n_epochs", 10)),
@@ -125,6 +136,12 @@ def resolve_train_settings(args, config):
     }
     if settings["dataset"] not in {"mnist", "cifar10"}:
         raise ValueError(f"Unsupported dataset '{settings['dataset']}'.")
+    if settings["backbone"] not in {"convstack", "unet"}:
+        raise ValueError(f"Unsupported backbone '{settings['backbone']}'. Choose 'convstack' or 'unet'.")
+    if noise_source not in {"gaussian", "quantum"}:
+        raise ValueError(f"Unsupported noise_source '{noise_source}'. Choose 'gaussian' or 'quantum'.")
+    if noise_source == "quantum" and not settings["quantum_data_path"]:
+        raise ValueError("noise_source='quantum' requires a non-empty 'quantum_data_path'.")
     settings["img_size"] = (32, 32, 3) if settings["dataset"] == "cifar10" else (28, 28, 1)
     settings["hidden_dims"] = [settings["hidden_dim"] for _ in range(settings["n_layers"])]
     return settings

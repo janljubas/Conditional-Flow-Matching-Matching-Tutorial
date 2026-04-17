@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train Conditional Flow Matching model from notebook 01."""
+"""Train CFM model using the torchcfm library (Tong et al.)."""
 
 import json
 import sys
@@ -13,9 +13,14 @@ from torchvision.datasets import CIFAR10, MNIST
 from torchvision.transforms import ToTensor
 from torchvision.utils import make_grid, save_image
 
+from torchcfm.conditional_flow_matching import (
+    ConditionalFlowMatcher,
+    ExactOptimalTransportConditionalFlowMatcher,
+)
+from torchcfm.models.unet import UNetModel as UNetModelWrapper
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from model import build_velocity_net
 from noise import build_noise_sampler
 from utils import (
     build_train_parser,
@@ -47,7 +52,7 @@ def load_dataset(dataset, dataset_path, train_batch_size, inference_batch_size, 
 def save_training_curve(run_dir: Path, history):
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(history["epoch"], history["train_loss"], label="train_loss")
-    ax.set_title("CFM Training Loss")
+    ax.set_title("CFM (torchcfm) Training Loss")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.grid(alpha=0.3)
@@ -58,21 +63,46 @@ def save_training_curve(run_dir: Path, history):
 
 
 @torch.no_grad()
+def sample_euler(model, t_steps, shape, device, noise_sampler=None):
+    """Generate samples by Euler-integrating the learned ODE.
+    If noise_sampler is provided, initial x_0 is drawn from it."""
+    if noise_sampler is not None:
+        x = noise_sampler.sample(shape, device)
+    else:
+        x = torch.randn(size=shape, device=device)
+    delta = 1.0 / max(t_steps - 1, 1)
+    t_vals = torch.linspace(0, 1, t_steps, device=device)
+
+    for i in range(t_steps - 1):
+        t_cur = torch.full((shape[0],), t_vals[i].item(), device=device)
+        x = x + model(t_cur, x) * delta
+    return x
+
+
+@torch.no_grad()
 def save_sample_grid(model, run_dir: Path, sample_steps, num_sample_images, img_size, device, noise_sampler=None):
     samples_dir = run_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
 
     h, w, c = img_size
-    generated = model.sample(t_steps=sample_steps, shape=[num_sample_images, c, h, w], device=device, noise_sampler=noise_sampler)
+    generated = sample_euler(model, t_steps=sample_steps, shape=[num_sample_images, c, h, w], device=device, noise_sampler=noise_sampler)
     save_image(generated, samples_dir / f"samples_steps{sample_steps}.png", nrow=8, normalize=True)
 
     fig = plt.figure(figsize=(6, 6))
     plt.axis("off")
-    plt.title(f"CFM samples (steps={sample_steps})")
+    plt.title(f"torchcfm samples (steps={sample_steps})")
     plt.imshow(make_grid(generated.detach().cpu(), padding=2, normalize=True).permute(1, 2, 0))
     fig.tight_layout()
     fig.savefig(samples_dir / f"grid_steps{sample_steps}.png", dpi=150)
     plt.close(fig)
+
+
+def build_cfm(settings):
+    """Build the flow matcher object based on config."""
+    sigma = settings["cfm_sigma"]
+    if settings["cfm_variant"] == "otcfm":
+        return ExactOptimalTransportConditionalFlowMatcher(sigma=sigma)
+    return ConditionalFlowMatcher(sigma=sigma)
 
 
 def train(settings, run_dir: Path):
@@ -81,11 +111,20 @@ def train(settings, run_dir: Path):
 
     seed_everything(settings["seed"])
     device = resolve_device(settings)
-    model = build_velocity_net(settings).to(device)
+
+    h, w, c = settings["img_size"]
+    model = UNetModelWrapper(
+        dim=(c, h, w),
+        num_channels=settings["num_channels"],
+        num_res_blocks=settings["num_res_blocks"],
+    ).to(device)
+
     noise_sampler = build_noise_sampler(settings)
-    print(f"Backbone: {settings['backbone']} | Noise: {settings['noise_source']} "
-          f"| Params: {sum(p.numel() for p in model.parameters()):,}")
+    nparams = sum(p.numel() for p in model.parameters())
+    print(f"torchcfm UNet | Noise: {settings['noise_source']} | Params: {nparams:,} | CFM variant: {settings['cfm_variant']}")
+
     optimizer = AdamW(model.parameters(), lr=settings["lr"], betas=(0.9, 0.99))
+    cfm = build_cfm(settings)
 
     train_loader, _ = load_dataset(
         settings["dataset"],
@@ -96,7 +135,7 @@ def train(settings, run_dir: Path):
     )
 
     history = {"epoch": [], "train_loss": []}
-    print("Start training CFM...")
+    print("Start training (torchcfm)...")
     model.train()
     start = time.time()
 
@@ -106,25 +145,29 @@ def train(settings, run_dir: Path):
             optimizer.zero_grad()
             x_1 = x_1.to(device)
             x_0 = noise_sampler.sample_like(x_1)
-            t = torch.rand(x_1.shape[0], 1, 1, 1, device=device)
 
-            x_t = model.interpolate(x_0, x_1, t)
-            velocity_target = model.get_velocity(x_0, x_1)  # u_t(x|z) = x_1 - x_0; the conditional velocity interpolation based on actual x_1 ~ p_1 samples
-            velocity_pred = model(x_t, t)                   # v_theta(x_t, t); the velocity field estimated by the model
+            # torchcfm computes x_t and u_t for us (Eq.14 + Eq.15)
+            t, x_t, u_t = cfm.sample_location_and_conditional_flow(x_0, x_1)
+            t = t.to(device)
+            x_t = x_t.to(device)
+            u_t = u_t.to(device)
 
-            loss = ((velocity_pred - velocity_target) ** 2).mean()  # L_CFM = E[||v_theta(x_t, t) - u_t(x|z)||^2]
+            # torchcfm UNet signature: forward(t, x) where t is shape (B,)
+            v_pred = model(t, x_t)
+
+            loss = ((v_pred - u_t) ** 2).mean()
             total_loss += loss.item()
             loss.backward()
             optimizer.step()
 
             if batch_idx % 100 == 0:
                 grad_norm = sum(p.grad.norm().item() for p in model.parameters() if p.grad is not None)
-                print("\t\tCFM loss:", loss.item(), " grad_norm:", grad_norm)
+                print(f"\t\tCFM loss: {loss.item():.6f}  grad_norm: {grad_norm:.4f}")
 
         epoch_loss = total_loss / len(train_loader)
         history["epoch"].append(epoch + 1)
         history["train_loss"].append(float(epoch_loss))
-        print("\tEpoch", epoch + 1, "complete!\tCFM loss:", epoch_loss)
+        print(f"\tEpoch {epoch + 1} complete!\tCFM loss: {epoch_loss:.6f}")
 
         if (epoch + 1) % settings["checkpoint_every"] == 0 or epoch + 1 == settings["n_epochs"]:
             torch.save(
@@ -158,12 +201,12 @@ def train(settings, run_dir: Path):
 
 def main():
     args = build_train_parser().parse_args()
-    run_dir = prepare_run_dir(args.run_dir, "CFM")
+    run_dir = prepare_run_dir(args.run_dir, "CFM_torchcfm")
     config = load_yaml_config(Path(args.config))
     settings = resolve_train_settings(args, config)
 
     out = train(settings, run_dir)
-    metrics = {"pipeline": "cfm_mnist", "elapsed_sec": out["elapsed_sec"], "settings": settings}
+    metrics = {"pipeline": "cfm_torchcfm", "elapsed_sec": out["elapsed_sec"], "settings": settings}
     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     (run_dir / "history.json").write_text(json.dumps(out["history"], indent=2))
 
